@@ -12,7 +12,16 @@ const (
 )
 
 func (r DropReason) String() string {
-	return "unknown" // TODO: 实现
+	switch r {
+	case DropNone:
+		return "none"
+	case DropQueueFull:
+		return "queue-full"
+	case DropClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
 }
 
 // Stats 记录单个订阅的可区分投递统计。

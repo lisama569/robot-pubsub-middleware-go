@@ -31,7 +31,16 @@ type Message struct {
 	Payload []byte
 }
 
-// Validate 校验消息版本是否被支持。不支持时返回 ErrUnsupportedVersion。
+// Validate 校验消息版本是否被支持。supported 为空时默认仅接受 Version1。
+// 不支持时返回 ErrUnsupportedVersion（明确拒绝，而非静默丢弃）。
 func Validate(m Message, supported []Version) error {
-	return nil // TODO: 实现
+	if len(supported) == 0 {
+		supported = []Version{Version1}
+	}
+	for _, v := range supported {
+		if m.Version == v {
+			return nil
+		}
+	}
+	return ErrUnsupportedVersion
 }
