@@ -67,18 +67,18 @@ func TestBackpressureDropOldest(t *testing.T) {
 		}
 	}
 	fst := fast.Stats()
-	t.Logf("fast stats: delivered=%d droppedFull=%d", fst.Delivered, fst.DroppedFull)
-	if fst.Delivered != n || fst.DroppedFull != 0 {
+	t.Logf("fast stats: delivered=%d droppedOldest=%d", fst.Delivered, fst.DroppedOldest)
+	if fst.Delivered != n || fst.DroppedOldest != 0 {
 		t.Fatalf("fast subscriber affected by slow one: %+v", fst)
 	}
 
 	// 慢订阅者队列容量 4：10 条全部入队（Delivered=10），
-	// 其中 6 条最旧的在被消费前被淘汰（DroppedFull=6），队列中只剩最新 4 条。
+	// 其中 6 条最旧的在被消费前被淘汰（DroppedOldest=6），队列中只剩最新 4 条。
 	sst := slow.Stats()
-	t.Logf("slow stats: delivered=%d droppedFull=%d (queue=4, published=%d)",
-		sst.Delivered, sst.DroppedFull, n)
-	if sst.Delivered != 10 || sst.DroppedFull != 6 {
-		t.Fatalf("slow subscriber stats = %+v, want delivered=10 droppedFull=6", sst)
+	t.Logf("slow stats: delivered=%d droppedOldest=%d (queue=4, published=%d)",
+		sst.Delivered, sst.DroppedOldest, n)
+	if sst.Delivered != 10 || sst.DroppedOldest != 6 {
+		t.Fatalf("slow subscriber stats = %+v, want delivered=10 droppedOldest=6", sst)
 	}
 	for i := 6; i < n; i++ {
 		m := recv(t, slow)

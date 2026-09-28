@@ -18,6 +18,14 @@ var (
 	ErrEmptyTopic = errors.New("middleware: empty topic")
 	// ErrPositionRegression 表示确认位点回退（确认的序列号小于已确认位点）。
 	ErrPositionRegression = errors.New("middleware: ack position regression")
+	// ErrAckNotDelivered 表示确认了一个尚未交付到本订阅的位点（超过已入队位点）。
+	ErrAckNotDelivered = errors.New("middleware: ack position not delivered")
+	// ErrAckGap 表示确认区间内存在未交付空档：消息曾命中本订阅但因队列超限被丢，
+	// 无法视为连续确认；需从已确认位点重连续传补齐后再确认。
+	ErrAckGap = errors.New("middleware: ack range has undelivered gap")
+	// ErrPositionExpired 表示位点已超出 Broker 保留窗口（消息不可恢复），
+	// Ack 与 Subscribe 的续传位点校验共用此错误。
+	ErrPositionExpired = errors.New("middleware: position outside retention window")
 	// ErrClosed 表示对已关闭的 Broker 或 Subscription 进行操作。
 	ErrClosed = errors.New("middleware: closed")
 )
