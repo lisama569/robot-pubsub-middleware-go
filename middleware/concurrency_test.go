@@ -98,6 +98,55 @@ func TestConcurrentLifecycle(t *testing.T) {
 	t.Logf("concurrent lifecycle finished cleanly: no deadlock, no panic, monotonic seqs")
 }
 
+// 续传积压期间并发退订/关闭：续传泵不得因向已关闭通道投递而 panic
+// （泵一旦 panic 死亡，后续所有订阅都会静默停滞），Close 必须正常返回。
+func TestConcurrentUnsubscribeDuringReplay(t *testing.T) {
+	for iter := 0; iter < 30; iter++ {
+		b := NewBroker(Config{QueueSize: 1, Retention: 8192})
+		for i := 0; i < 300; i++ {
+			if _, err := b.Publish("t", Version1, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		const nsub = 8
+		var wg sync.WaitGroup
+		subs := make([]*Subscription, nsub)
+		for i := 0; i < nsub; i++ {
+			s, err := b.Subscribe("t", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			subs[i] = s
+			wg.Add(1)
+			go func(s *Subscription) {
+				defer wg.Done()
+				for range s.C() {
+				}
+			}(s)
+		}
+		var uwg sync.WaitGroup
+		for i := 0; i < nsub; i++ {
+			uwg.Add(1)
+			go func(s *Subscription) {
+				defer uwg.Done()
+				s.Unsubscribe()
+			}(subs[i])
+		}
+		uwg.Wait()
+		// 退订后再发布并关闭：若泵已死或有残留竞态，这里会卡住或 panic。
+		for i := 0; i < 50; i++ {
+			if _, err := b.Publish("t", Version1, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := b.Close(); err != nil {
+			t.Fatalf("iteration %d: %v", iter, err)
+		}
+		wg.Wait()
+	}
+	t.Logf("30 iterations of unsubscribe-during-replay finished without pump panic")
+}
+
 // 并发重连续传：多个订阅者并发地断线重连，已确认消息不得重复交付。
 func TestConcurrentResume(t *testing.T) {
 	// 队列需容纳整段重放窗口，否则最旧消息会按淘汰策略被丢弃（确定性行为，

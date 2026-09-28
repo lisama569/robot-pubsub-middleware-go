@@ -1,8 +1,8 @@
 # robot-pubsub-middleware-go
 
 进程内机器人组件通信中间件（Go）。支持主题通配发布/订阅、可校验序列号与版本、
-可靠投递与断线续传、背压控制以及并发安全的生命周期管理。全部验证在本机完成，
-无需任何外部服务。
+可靠投递与断线续传、**可选背压策略**、**严格的确认位点校验**与**按去向分开的
+消息统计**，以及并发安全的生命周期管理。全部验证在本机完成，无需任何外部服务。
 
 ## 快速开始
 
@@ -14,12 +14,20 @@ b := middleware.NewBroker(middleware.Config{
 })
 defer b.Close()
 
-sub, _ := b.Subscribe("robot/#", 0) // 0 表示从头开始；重连时传入上次确认位点
+// 建立订阅时声明队列满后的处理策略。
+sub, _ := b.SubscribeWith("robot/#", 0, middleware.SubscribeOptions{
+    Policy: middleware.PolicyDropOldest, // 或 PolicyDropNewest
+})
 seq, _ := b.Publish("robot/telemetry", middleware.Version1, []byte("payload"))
+_ = seq
 
-m := <-sub.C()
-sub.Ack(m.Seq) // 推进确认位点
+for m := range sub.C() { // 通道排空后自动结束（range）
+    sub.Ack(m.Seq) // 推进确认位点
+}
 ```
+
+> `Subscribe(pattern, resumeFrom)` 仍保留，等价于用默认策略
+> `PolicyDropOldest` 调 `SubscribeWith`，旧代码无需改动。
 
 ## 主题匹配规则
 
@@ -40,48 +48,95 @@ sub.Ack(m.Seq) // 推进确认位点
   因此订阅侧看到的序列号严格连续递增，可直接作为确认位点。
 - 版本不在 `SupportedVersions` 内的消息在发布入口被**明确拒绝**，
   返回 `ErrUnsupportedVersion`，不会静默丢弃，更不会进入任何订阅队列。
-- 同一订阅内，序列号不大于已入队位点的重复消息被拒绝交付，
+- 同一订阅内，序列号不大于已交付水位的重复消息被拒绝交付，
   并计入 `Stats.Duplicates`。
 
-## 投递与续传语义
+## 背压策略（建立订阅时声明）
 
-- `Subscribe(pattern, resumeFrom)`：`resumeFrom` 为已确认位点（全局序列号）。
-  订阅建立时，Broker 从保留日志中重放 `Seq > resumeFrom` 且匹配模式的消息，
-  之后实时消息接续投递。重连时传入上次 `Position()` 即可从确认位点继续，
-  已确认消息不重复、未确认消息不丢失。
-- 重放受 `Retention` 限制：早于保留窗口的消息不可恢复（确定语义）。
-- `Ack(seq)` 推进确认位点；**位点回退被明确拒绝**，返回包装
-  `ErrPositionRegression` 的错误，其中携带当前位点与尝试值，便于区分原因。
+每个订阅有独立的定长缓冲队列（`QueueSize`）。发布路径对订阅队列只做
+**非阻塞**操作：无论哪种策略，**慢订阅者都不会阻塞发布方或其他订阅者**。
+策略通过 `SubscribeOptions.Policy` 声明，生命周期内不变：
+
+| 策略 | 队列满时的行为 | 谁被丢 | 丢失计数 |
+| --- | --- | --- | --- |
+| `PolicyDropOldest`（默认） | **留着最新的**：挤掉一条最旧消息给新消息腾位，新消息照常入队 | 最旧的未消费消息 | `DroppedOldest` |
+| `PolicyDropNewest` | **留着先来的**：直接拒收这条新消息，已排队的消息原封不动 | 新来的消息 | `DroppedNewest` |
+
+- 未知策略值在 `SubscribeWith` 处被明确拒绝，返回 `ErrInvalidPolicy`；
+  零值 `PolicyDefault` 规范化为 `PolicyDropOldest`。
+- 两种丢法**分别计数、互不混淆**，可据 `Subscription.Policy()` 与
+  统计字段判断到底是哪一步、以哪种方式丢的。
+
+## 确认位点：严格校验与可区分原因
+
+`Ack(seq)` 表示确认 `seq`（含）之前的消息。除了原有的“不许回退”，
+现在还会拒绝“确认到没交到手的位置”和“跨过未补齐的空档”，三类非法确认
+**原因互不相同**，都可用 `errors.Is` 区分，且被拒绝时位点保持不变：
+
+| 错误 | 触发条件 |
+| --- | --- |
+| `ErrPositionRegression` | `seq` 小于当前已确认位点（位点回退） |
+| `ErrAckNotDelivered` | `seq` 超过该订阅实际已交到手上的水位（确认了一个从没交付的位置；续传暂停期间确认尚未补到的位点也属此类） |
+| `ErrAckGap` | `(当前位点, seq]` 区间内存在**见过但已判定丢失、尚未补齐**的位点（例如 DropOldest 已挤掉、还没靠重连续传补回），不允许跨过空档确认 |
+
+非匹配主题的序列号不计入空档——只订阅 `a` 时，确认位点可以越过只发到 `b`
+的消息（缺口按“匹配该订阅的消息”计算，而非全局每一条）。
+
+## 投递、续传与兼容范围
+
+- `SubscribeWith(pattern, resumeFrom, opts)`：`resumeFrom` 为已确认位点
+  （全局序列号），`0` 表示从头开始。
+- 建立订阅时，Broker 从保留日志中**按全局顺序、在队列有空位时懒重放**
+  `Seq > resumeFrom` 且匹配模式的消息——包括该订阅上一代因背压丢过、
+  但仍在保留窗口内的缺口消息。续传期间队列满只会**暂停补入**（不会再次
+  淘汰或拒收），消费腾出空位后继续，因此**补完后的结果与“一直在线且始终
+  跟得上”一模一样，不重不漏**。续传进行中到达的实时消息会排在缺口之后，
+  保证严格按序。
+- 重放受 `Retention` 限制，建立订阅时会校验位点并给出可区分错误：
+  - `ErrPositionExpired`：`resumeFrom` 早于保留窗口的最早可重放消息，
+    中间缺口已无法从日志补齐，明确拒绝而不是静默少给；
+  - `ErrAckNotDelivered`：`resumeFrom` 超过 Broker 已发布的最大位点；
+  - `resumeFrom == 0`（从头开始）不受保留窗口限制，只给窗口内尚存的消息。
 - 订阅退订（`Unsubscribe`）或 Broker 关闭后，已入队消息仍可排空读取，
   排空后交付通道关闭（`range` 正常结束）。
 
-## 背压处理策略
+## 消息去向统计（退订/关闭后可查、可对账）
 
-- 每个订阅有独立的定长缓冲队列（`QueueSize`），发布路径对订阅队列只做
-  非阻塞写入：**慢订阅者不会阻塞发布方或其他订阅者**。
-- 队列满时按确定策略**淘汰最旧消息**（drop-oldest），新消息仍然入队。
-- 统计可区分（`Subscription.Stats()`）：
-  - `Delivered`：成功入队的消息数；
-  - `DroppedFull`：因队列超限、在被消费前被淘汰的最旧消息数；
-  - `DroppedLate`：关闭后到达被丢弃的消息数；
-  - `Duplicates`：因序列号重复被拒绝交付的消息数。
+`Subscription.Stats()` 返回本次订阅生命周期内的消息去向汇总，
+各项语义互不重叠，退订或关闭后仍可查询且定格不变：
+
+| 字段 | 语义 |
+| --- | --- |
+| `Delivered` | 成功进入订阅队列的匹配消息数（含之后被挤掉的） |
+| `DroppedOldest` | DropOldest 下、队列满时被挤掉的最旧消息数 |
+| `DroppedNewest` | DropNewest 下、队列满时被拒收的新消息数 |
+| `DroppedLate` | 退订或 Broker 关闭**之后**才到达、因而被丢的匹配消息数 |
+| `Duplicates` | 序列号不大于已交付水位、因重复被挡下的消息数 |
+
+勾稽关系（单个订阅，重复消息不属于“新匹配消息”，单列）：
+
+```
+匹配消息总数 = Delivered + DroppedNewest + DroppedLate
+实际读到     = Delivered - DroppedOldest        # 被挤掉的旧消息确实入过队
+```
 
 ## 并发与关闭语义
 
-- `Publish` / `Subscribe` / `Unsubscribe` / `Close` 可任意并发调用：
+- `Publish` / `SubscribeWith` / `Unsubscribe` / `Close` 可任意并发调用：
   锁序固定为 `broker.mu -> sub.mu`，不会死锁；`Close` 与 `Unsubscribe` 幂等。
-- `Close` 之后：`Publish` / `Subscribe` 返回 `ErrClosed`；
-  关闭前已入队各订阅缓冲的消息保留并可排空，排空后通道关闭；
-  关闭后到达订阅的消息计入 `DroppedLate`，不再交付。
+- 对交付通道的写入/淘汰都在订阅锁内以非阻塞方式原子完成，消费者无锁读通道，
+  不存在“先看队列长度再收发”的竞态。
+- `Close` 先停止后台续传泵、再在锁内关闭各订阅通道，不会向已关闭通道投递；
+  关闭后 `Publish` / `SubscribeWith` 返回 `ErrClosed`，关闭前已入队消息可排空。
 
 ## 本地验证
 
 无需任何外部服务，直接运行：
 
 ```sh
-go test ./...          # 全部单元测试
-go test -race ./...    # 竞态检测（可通过）
-go test ./middleware/ -v   # 查看序列号、位点与判定依据日志
+go test ./...              # 全部单元测试
+go test -race ./...        # 竞态检测（可通过）
+go test -v ./middleware/   # 查看序列号、位点与判定依据日志
 ```
 
 测试覆盖：
@@ -90,10 +145,18 @@ go test ./middleware/ -v   # 查看序列号、位点与判定依据日志
 | --- | --- |
 | `TestMatchTopic` | 主题与通配模式匹配规则 |
 | `TestPublishVersionValidation` | 未知版本明确拒绝、被拒发布不占序列号 |
-| `TestAckPositionRegression` | 位点回退拒绝并给出可区分原因 |
-| `TestResumeAfterReconnect` | 断线续传：从确认位点继续，不丢不重 |
-| `TestNoDuplicateDeliveryOnResubscribe` | 重复消息不重复交付 |
-| `TestBackpressureDropOldest` | 慢订阅者不阻塞他人、超限淘汰最旧、统计可区分 |
+| `TestBackpressureDropOldest` | 留新挤旧：慢订阅不阻塞他人、挤旧计数 |
+| `TestBackpressureDropNewest` | 留旧拒新：先到的保留、新消息拒收、不阻塞 |
+| `TestBackpressureCountersSeparated` | 两种丢法分别计数、互不串 |
+| `TestSubscribePolicyValidation` | 默认策略归一化、未知策略 `ErrInvalidPolicy` |
+| `TestAckPositionRegression` / `TestAckInvalidReasons` | 回退 / 未交付 / 空档三类非法确认可区分 |
+| `TestAckGapFilledByResume` / `TestAckDuringPartialFill` | 缺口续传补齐，中途与补完后的确认语义 |
+| `TestAckIgnoresNonMatchingSeq` | 非匹配主题序列号不构成空档 |
+| `TestResumePositionValidation` | 续传位点过期 `ErrPositionExpired` 与超前 `ErrAckNotDelivered` |
+| `TestResumeAfterReconnect` / `TestConcurrentResume` | 断线续传不丢不重、多代重连位点一致 |
+| `TestStatsReconciliation` 等 | 去向四项分开计数、勾稽关系、关闭后定格可查 |
 | `TestCloseSemantics` | 关闭幂等、关闭前排空、关闭后 `ErrClosed` |
 | `TestConcurrentLifecycle` | 并发发布/订阅/退订/关闭无死锁无 panic |
-| `TestConcurrentResume` | 多代重连续传，最终位点与发布总数一致 |
+| `TestConcurrentUnsubscribeDuringReplay` | 续传积压期间并发退订不杀死续传泵 |
+| `TestConcurrentMixedBackpressure` | 多发布方×多订阅方、两种策略、极小队列：不卡死且账目对得上 |
+| `TestConcurrentTinyQueueResume` | 队列容量 1 的高并发多代续传，最终位点不重不漏 |
