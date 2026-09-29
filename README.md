@@ -70,14 +70,22 @@ for m := range sub.C() { // 通道排空后自动结束（range）
 ## 确认位点：严格校验与可区分原因
 
 `Ack(seq)` 表示确认 `seq`（含）之前的消息。除了原有的“不许回退”，
-现在还会拒绝“确认到没交到手的位置”和“跨过未补齐的空档”，三类非法确认
+现在还会拒绝“确认到没交到手的位置”和“跨过未补齐的空档”，四类非法确认
 **原因互不相同**，都可用 `errors.Is` 区分，且被拒绝时位点保持不变：
 
 | 错误 | 触发条件 |
 | --- | --- |
 | `ErrPositionRegression` | `seq` 小于当前已确认位点（位点回退） |
 | `ErrAckNotDelivered` | `seq` 超过该订阅实际已交到手上的水位（确认了一个从没交付的位置；续传暂停期间确认尚未补到的位点也属此类） |
-| `ErrAckGap` | `(当前位点, seq]` 区间内存在**见过但已判定丢失、尚未补齐**的位点（例如 DropOldest 已挤掉、还没靠重连续传补回），不允许跨过空档确认 |
+| `ErrAckGap` | `(当前位点, seq]` 区间内存在**已判定丢失、但仍在保留窗口内**的位点（例如 DropOldest 已挤掉、还没靠重连续传补回）——空档**还来得及补齐**，继续消费并重连续传即可，不要重置 |
+| `ErrPositionExpired` | `(当前位点, seq]` 区间内存在**已判定丢失、且已滚出保留窗口**的位点——空档**怎么重连都补不回来**，确认位点永远无法跨过它，应尽快**重置**（按新位点重新订阅）而不是继续等 |
+
+两种空档的判定边界：把区间内最早的丢失位点与保留日志当前最早序列号
+（窗口下沿）比较——丢失位点 **== 下沿**时消息仍在窗口内（可补齐，报
+`ErrAckGap`），**严格小于下沿**才算彻底过期（报 `ErrPositionExpired`），
+刚好卡在边缘、只差一条还能补齐的情况不会被误判成过期，反之亦然。
+续传积压中的订阅还没来得及补到的消息若被保留窗口裁掉，同样会被记为
+丢失位点，确认跨过时按 `ErrPositionExpired` 明确拒绝，不会静默漏过。
 
 非匹配主题的序列号不计入空档——只订阅 `a` 时，确认位点可以越过只发到 `b`
 的消息（缺口按“匹配该订阅的消息”计算，而非全局每一条）。
@@ -150,6 +158,9 @@ go test -v ./middleware/   # 查看序列号、位点与判定依据日志
 | `TestBackpressureCountersSeparated` | 两种丢法分别计数、互不串 |
 | `TestSubscribePolicyValidation` | 默认策略归一化、未知策略 `ErrInvalidPolicy` |
 | `TestAckPositionRegression` / `TestAckInvalidReasons` | 回退 / 未交付 / 空档三类非法确认可区分 |
+| `TestAckGapRecoverableVsExpired` / `TestAckGapRetentionBoundary` | 可补齐空档（`ErrAckGap`）与已过期空档（`ErrPositionExpired`）可区分；窗口下沿边界两个方向都不误判 |
+| `TestAckGapTrimmedBeforeReplay` | 续传未追到就被裁掉的消息记为永久空档，确认跨过按过期拒绝 |
+| `TestAckGapRecoverableReconnectFill` / `TestAckGapExpiredReset` | 可补齐空档重连补齐后与一直在线一致；已过期空档只能重置后推进 |
 | `TestAckGapFilledByResume` / `TestAckDuringPartialFill` | 缺口续传补齐，中途与补完后的确认语义 |
 | `TestAckIgnoresNonMatchingSeq` | 非匹配主题序列号不构成空档 |
 | `TestResumePositionValidation` | 续传位点过期 `ErrPositionExpired` 与超前 `ErrAckNotDelivered` |
@@ -160,3 +171,4 @@ go test -v ./middleware/   # 查看序列号、位点与判定依据日志
 | `TestConcurrentUnsubscribeDuringReplay` | 续传积压期间并发退订不杀死续传泵 |
 | `TestConcurrentMixedBackpressure` | 多发布方×多订阅方、两种策略、极小队列：不卡死且账目对得上 |
 | `TestConcurrentTinyQueueResume` | 队列容量 1 的高并发多代续传，最终位点不重不漏 |
+| `TestConcurrentAckReconnectTinyQueue` | 多发布方×多订阅者、极小队列+有限保留窗口：按 `ErrAckGap` 重连补齐、按 `ErrPositionExpired` 重置，不卡死且最终位点全部对齐发布总数 |

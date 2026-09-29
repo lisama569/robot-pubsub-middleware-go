@@ -174,17 +174,29 @@ func (b *Broker) Publish(topic string, version Version, payload []byte) (uint64,
 	m.Seq = b.seq
 	b.log = append(b.log, m)
 	if cut := len(b.log) - b.cfg.Retention; cut > 0 {
+		trimmed := b.log[:cut]
 		b.log = append([]Message(nil), b.log[cut:]...)
+		floor := b.log[0].Seq
 		for s := range b.subs {
-			// 只调整仍在续传积压中的游标；已追上实时的订阅游标本就等于日志长度，
-			// 裁剪后应继续指向新的日志末尾，绝不能回移到保留区内部
-			// （否则会被误判为“仍有积压”，实时投递错误地转入续传而停滞）。
-			if s.replayPending && s.replayIdx > 0 {
-				s.replayIdx -= cut
-				if s.replayIdx < 0 {
-					s.replayIdx = 0
+			if s.replayPending {
+				// 续传游标还没追到就被裁掉的匹配消息：对该订阅构成
+				// 永久缺口，记为丢失位点，Ack 跨过时按过期明确拒绝。
+				if s.replayIdx < cut {
+					s.noteTrimmed(trimmed[s.replayIdx:])
+				}
+				// 只调整仍在续传积压中的游标；已追上实时的订阅游标本就等于日志长度，
+				// 裁剪后应继续指向新的日志末尾，绝不能回移到保留区内部
+				// （否则会被误判为“仍有积压”，实时投递错误地转入续传而停滞）。
+				if s.replayIdx > 0 {
+					s.replayIdx -= cut
+					if s.replayIdx < 0 {
+						s.replayIdx = 0
+					}
 				}
 			}
+			// 通知各订阅保留窗口下沿已前移：Ack 据此把滚出窗口的丢失位点
+			// 判定为 ErrPositionExpired 而非可补齐的 ErrAckGap。
+			s.retentionFloor.Store(floor)
 		}
 	}
 	end := len(b.log)
@@ -268,6 +280,9 @@ func (b *Broker) SubscribeWith(pattern string, resumeFrom uint64, opts Subscribe
 		lastSeen:  resumeFrom,
 		lastAcked: resumeFrom,
 		onClose:   b.removeSub,
+	}
+	if len(b.log) > 0 {
+		sub.retentionFloor.Store(b.log[0].Seq)
 	}
 	// 游标定位到第一条严格新于 resumeFrom 的日志。
 	sub.replayIdx = len(b.log)

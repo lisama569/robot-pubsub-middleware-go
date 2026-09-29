@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // Subscription 表示一个订阅。消息经 C() 交付；消费后调用 Ack 推进确认位点。
@@ -24,6 +25,11 @@ type Subscription struct {
 	lastAcked uint64   // 已确认位点
 	lost      []uint64 // 已判定丢失、尚未靠续传补齐的匹配位点，严格升序
 	stats     Stats
+
+	// retentionFloor 是 Broker 保留日志当前最早消息的序列号（0 表示尚无日志）。
+	// 由 Broker 在建立订阅与裁剪保留窗口时更新（atomic，免锁读取）；
+	// Ack 据此区分丢失位点是“仍在窗口内、重连可补齐”还是“已滚出窗口、无法补齐”。
+	retentionFloor atomic.Uint64
 
 	// 续传游标，仅由 Broker 持有 broker.mu 时访问：
 	// replayIdx 是下一条待考虑的保留日志下标；replayPending 表示尚有积压未续完。
@@ -160,6 +166,23 @@ func (s *Subscription) pruneLostLocked() {
 	s.lost = append(s.lost[:0], s.lost[i:]...)
 }
 
+// noteTrimmed 由 Broker 在裁剪保留窗口时调用（持有 broker.mu，锁序 broker.mu -> sub.mu）。
+// 续传积压中的订阅还没来得及补到的匹配消息一旦被裁掉，就永远无法补齐：
+// 把它们记为丢失位点，Ack 跨过时才能按 ErrPositionExpired 明确拒绝，
+// 而不是让确认位点静默漏过这段空档。
+// 过滤条件 m.Seq > s.lastSeen 恰好选中“尚未被续传游标考虑过”的匹配消息：
+// 续传路径上已被考虑且匹配的消息要么已入队（lastSeen 随之推进），
+// 要么因队列满停在游标上（下标不小于游标，不会被本次裁剪波及）。
+func (s *Subscription) noteTrimmed(trimmed []Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range trimmed {
+		if m.Seq > s.lastSeen && MatchTopic(s.pattern, m.Topic) {
+			s.addLostLocked(m.Seq)
+		}
+	}
+}
+
 // close 标记关闭并关闭交付通道，幂等。已入队消息保留在缓冲中供排空。
 // 所有通道写入都在 s.mu 内，close(ch) 与之互斥，不会向已关闭通道投递。
 func (s *Subscription) close() {
@@ -176,7 +199,14 @@ func (s *Subscription) close() {
 // 且原因可通过 errors.Is 区分，位点保持不变：
 //   - ErrPositionRegression：seq 小于当前已确认位点（回退）；
 //   - ErrAckNotDelivered：seq 超过该订阅已交到手上的水位（确认到一个没交到手的位置）；
-//   - ErrAckGap：(当前位点, seq] 区间内存在已判定丢失、尚未补齐的位点（中间留了空档）。
+//   - ErrAckGap：(当前位点, seq] 区间内存在已判定丢失、但仍在保留窗口内、
+//     重连续传即可补齐的位点——继续等补齐即可，不要重置；
+//   - ErrPositionExpired：(当前位点, seq] 区间内存在已判定丢失、且已滚出保留
+//     窗口的位点——该位点怎么重连都补不回来，确认位点永远无法跨过它，
+//     应尽快重置（按新位点重新订阅）而不是继续等。
+//
+// 两种空档的边界按丢失位点与保留窗口下沿比较判定：丢失位点 == 窗口最早
+// 序列号时消息仍在窗口内（可补齐，报 ErrAckGap）；严格小于下沿才算彻底过期。
 func (s *Subscription) Ack(seq uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -190,8 +220,13 @@ func (s *Subscription) Ack(seq uint64) error {
 	}
 	i := sort.Search(len(s.lost), func(i int) bool { return s.lost[i] > s.lastAcked })
 	if i < len(s.lost) && s.lost[i] <= seq {
-		return fmt.Errorf("%w: attempted ack %d skips undelivered position %d (position %d)",
-			ErrAckGap, seq, s.lost[i], s.lastAcked)
+		gap := s.lost[i]
+		if floor := s.retentionFloor.Load(); floor > 0 && gap < floor {
+			return fmt.Errorf("%w: attempted ack %d skips position %d which is older than oldest retained %d (position %d); reset the subscription",
+				ErrPositionExpired, seq, gap, floor, s.lastAcked)
+		}
+		return fmt.Errorf("%w: attempted ack %d skips undelivered position %d (position %d); still recoverable via resume",
+			ErrAckGap, seq, gap, s.lastAcked)
 	}
 	s.lastAcked = seq
 	s.pruneLostLocked()

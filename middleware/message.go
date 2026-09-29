@@ -24,8 +24,10 @@ var (
 	// ErrAckGap 表示确认区间内存在已判定丢失、尚未补齐的位点
 	// （典型：DropOldest 挤掉的消息还没靠重连续传补回），不允许跨过空档确认。
 	ErrAckGap = errors.New("middleware: ack position has a gap")
-	// ErrPositionExpired 表示续传起始位点早于 Broker 保留窗口的最早消息，
-	// 中间缺口已无法从保留日志补齐。
+	// ErrPositionExpired 表示位点早于 Broker 保留窗口的最早消息，
+	// 中间缺口已无法从保留日志补齐：续传起始位点过期（SubscribeWith），
+	// 或确认区间内有已滚出保留窗口、怎么重连都补不回来的丢失位点（Ack）。
+	// 与 ErrAckGap（缺口仍在窗口内、重连可补齐）严格区分。
 	ErrPositionExpired = errors.New("middleware: resume position older than retention window")
 	// ErrInvalidPolicy 表示建立订阅时声明了未知的背压策略。
 	ErrInvalidPolicy = errors.New("middleware: invalid backpressure policy")
