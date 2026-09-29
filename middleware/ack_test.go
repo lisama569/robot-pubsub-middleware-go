@@ -26,12 +26,16 @@ func TestAckInvalidReasons(t *testing.T) {
 	t.Logf("after overflow: seen=%d droppedOldest=%d queue=[%d,%d]",
 		5, st.DroppedOldest, mustRecv(t, sub).Seq, mustRecv(t, sub).Seq)
 
-	// 1) 确认到一个从未交到手上的位置：seq6 > 已见水位 5。
+	// 1) Ack(6) 先撞上还在 lost 里的空档 seq1（仍在保留窗口内）：
+	// 必须按“可补齐的空档”ErrAckGap 拒绝，而不是越位提示，也绝不能误判成过期。
 	err = sub.Ack(6)
-	if !errors.Is(err, ErrAckNotDelivered) {
-		t.Fatalf("ack beyond watermark: got %v, want ErrAckNotDelivered", err)
+	if !errors.Is(err, ErrAckGap) {
+		t.Fatalf("ack over gap: got %v, want ErrAckGap", err)
 	}
-	t.Logf("not-delivered rejected: %v", err)
+	if errors.Is(err, ErrAckGapExpired) {
+		t.Fatalf("gap still in retention window must not be expired: %v", err)
+	}
+	t.Logf("recoverable gap rejected: %v", err)
 	if sub.Position() != 0 {
 		t.Fatalf("position moved after rejected ack: %d", sub.Position())
 	}
@@ -40,6 +44,9 @@ func TestAckInvalidReasons(t *testing.T) {
 	err = sub.Ack(5)
 	if !errors.Is(err, ErrAckGap) {
 		t.Fatalf("ack over gap: got %v, want ErrAckGap", err)
+	}
+	if errors.Is(err, ErrAckGapExpired) {
+		t.Fatalf("recoverable gap must not be expired: %v", err)
 	}
 	t.Logf("gap rejected: %v", err)
 	if sub.Position() != 0 {
@@ -183,11 +190,18 @@ func TestAckDuringPartialFill(t *testing.T) {
 	if s := gen1.Stats(); s.DroppedNewest != 2 {
 		t.Fatalf("gen1 droppedNewest=%d, want 2", s.DroppedNewest)
 	}
-	// seq4、5 被拒收、从未交到手上（水位停在 3）：确认到 5 是“确认到没交付的位置”。
-	if err := gen1.Ack(total); !errors.Is(err, ErrAckNotDelivered) {
-		t.Fatalf("gen1 ack over rejected-undelivered: got %v, want ErrAckNotDelivered", err)
+	// seq4、5 被拒收、记在 lost 中但仍在保留窗口内：确认到 5 必须按
+	// “还能补齐的空档”拒绝（ErrAckGap），不得误判成已过期；位点保持 0。
+	if err := gen1.Ack(total); !errors.Is(err, ErrAckGap) {
+		t.Fatalf("gen1 ack over rejected-undelivered: got %v, want ErrAckGap", err)
 	}
-	t.Logf("gen1 ack(%d) rejected with ErrAckNotDelivered (watermark=3)", total)
+	if errors.Is(err, ErrAckGapExpired) {
+		t.Fatalf("gen1 gap still in retention window must not be expired: %v", err)
+	}
+	if gen1.Position() != 0 {
+		t.Fatalf("gen1 position moved after rejected gap ack: %d", gen1.Position())
+	}
+	t.Logf("gen1 ack(%d) rejected with recoverable ErrAckGap (watermark=3)", total)
 	gen1.Unsubscribe()
 
 	// 重连懒续传：先补满队列（seq1-3），此时不消费，4、5 还没补；

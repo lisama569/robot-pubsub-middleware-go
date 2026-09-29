@@ -70,14 +70,41 @@ for m := range sub.C() { // 通道排空后自动结束（range）
 ## 确认位点：严格校验与可区分原因
 
 `Ack(seq)` 表示确认 `seq`（含）之前的消息。除了原有的“不许回退”，
-现在还会拒绝“确认到没交到手的位置”和“跨过未补齐的空档”，三类非法确认
-**原因互不相同**，都可用 `errors.Is` 区分，且被拒绝时位点保持不变：
+现在还会拒绝“确认到没交到手的位置”和“跨过未补齐的空档”。空档进一步分成
+**还来得及补齐**与**已超出保留范围、无法补齐**两种，拒绝原因互不相同，
+都可用 `errors.Is` 区分，且**被任何一种原因拒绝时确认位点都保持不变**：
 
-| 错误 | 触发条件 |
-| --- | --- |
-| `ErrPositionRegression` | `seq` 小于当前已确认位点（位点回退） |
-| `ErrAckNotDelivered` | `seq` 超过该订阅实际已交到手上的水位（确认了一个从没交付的位置；续传暂停期间确认尚未补到的位点也属此类） |
-| `ErrAckGap` | `(当前位点, seq]` 区间内存在**见过但已判定丢失、尚未补齐**的位点（例如 DropOldest 已挤掉、还没靠重连续传补回），不允许跨过空档确认 |
+| 错误 | 触发条件 | 建议处置 |
+| --- | --- | --- |
+| `ErrPositionRegression` | `seq` 小于当前已确认位点（位点回退） | 修正调用方逻辑 |
+| `ErrAckNotDelivered` | `seq` 超过该订阅实际已交到手上的水位（确认了一个从没交付的位置；续传暂停期间确认尚未补到的位点也属此类） | 等消息真正交到手上再确认 |
+| `ErrAckGap` | `(当前位点, seq]` 区间内存在**见过但已判定丢失、尚未补齐、且仍在保留窗口内**的位点（例如 DropOldest 已挤掉、还没靠重连续传补回） | **继续等补齐**：保持位点，尽快从当前确认位点重连即可补回 |
+| `ErrAckGapExpired` | 区间内的空档位点**已滚出保留窗口**，怎么重连都无法从保留日志补回（它同时 wrap `ErrAckGap`，见下） | **这个位点已经没救，尽快重置订阅**（从头订阅或按业务重置位点），而不是继续等待 |
+
+**边界判定（两种“只差一点点”不会互相误判）**：设保留窗口最早仍存活的
+消息为 `oldest`，区间内最早的丢失位点为 `g`：
+
+- `g >= oldest`（包括 `g == oldest`，刚好卡在窗口边缘）：判定为
+  **可补齐**的 `ErrAckGap`——这条消息还在窗口里，重连一定能补到；
+- `g < oldest`（哪怕只差 1，即 `g == oldest-1`）：判定为
+  **不可补齐**的 `ErrAckGapExpired`。
+
+这与 `SubscribeWith` 的续传合法性边界完全一致：`resumeFrom == oldest-1`
+仍允许建立订阅（`oldest` 起的消息都能补），更早的位点返回
+`ErrPositionExpired`。Broker 每发布一条消息、保留窗口发生裁剪时，都会
+把新的 `oldest` 水位推送给所有在线订阅，因此并发发布期间空档“刚刚过期”
+的瞬间，确认也能立刻得到正确分类，不会停留在旧的可补齐结论上。
+
+**错误分类的包含关系**：`ErrAckGapExpired` 同时 wrap `ErrAckGap`，即
+
+```go
+errors.Is(err, ErrAckGap)         // “任意空档”：可补齐和不可补齐都命中
+errors.Is(err, ErrAckGapExpired)  // 仅彻底不可补齐的空档命中
+```
+
+只想区分“有空档 vs. 其它非法确认”时用前者；要决定“继续等还是赶紧重置”
+时必须再用后者细分。只检查区间内**最早的一个**丢失位点即可决定原因，
+错误信息会同时给出该位点、当前确认位点和 `oldest`，便于对账。
 
 非匹配主题的序列号不计入空档——只订阅 `a` 时，确认位点可以越过只发到 `b`
 的消息（缺口按“匹配该订阅的消息”计算，而非全局每一条）。
@@ -97,6 +124,10 @@ for m := range sub.C() { // 通道排空后自动结束（range）
     中间缺口已无法从日志补齐，明确拒绝而不是静默少给；
   - `ErrAckNotDelivered`：`resumeFrom` 超过 Broker 已发布的最大位点；
   - `resumeFrom == 0`（从头开始）不受保留窗口限制，只给窗口内尚存的消息。
+- 在线消费期间遇到空档，按 `Ack` 的错误分类处置：收到可补齐的 `ErrAckGap`
+  时保持当前位点、稍后（或立即）从该位点重连即可，补完后的视图与一直在线
+  且跟得上的订阅一模一样；收到 `ErrAckGapExpired` 说明空档已永久丢失，
+  再怎么重连也补不回，应按业务重置（如从头订阅）而不是空等。
 - 订阅退订（`Unsubscribe`）或 Broker 关闭后，已入队消息仍可排空读取，
   排空后交付通道关闭（`range` 正常结束）。
 
@@ -137,6 +168,9 @@ for m := range sub.C() { // 通道排空后自动结束（range）
 go test ./...              # 全部单元测试
 go test -race ./...        # 竞态检测（可通过）
 go test -v ./middleware/   # 查看序列号、位点与判定依据日志
+
+# 只跑确认空档三类判定（可补齐 / 已过期 / 边界）与收敛、并发压力用例：
+go test -v -run 'TestAckGap|TestConcurrentGapExpiry' ./middleware/
 ```
 
 测试覆盖：
@@ -151,6 +185,11 @@ go test -v ./middleware/   # 查看序列号、位点与判定依据日志
 | `TestSubscribePolicyValidation` | 默认策略归一化、未知策略 `ErrInvalidPolicy` |
 | `TestAckPositionRegression` / `TestAckInvalidReasons` | 回退 / 未交付 / 空档三类非法确认可区分 |
 | `TestAckGapFilledByResume` / `TestAckDuringPartialFill` | 缺口续传补齐，中途与补完后的确认语义 |
+| `TestAckGapStillRecoverable` | 丢失位点仍在保留窗口：`ErrAckGap`（可补齐）拒绝，位点不动 |
+| `TestAckGapExpiredBeyondRetention` | 丢失位点滚出窗口：`ErrAckGapExpired` 拒绝且仍归类 `ErrAckGap`，重连也补不回 |
+| `TestAckGapRetentionBoundary` | 卡在窗口边缘的判定：`g == oldest` 可补齐、`g == oldest-1` 即过期，与续传边界一致 |
+| `TestAckGapRejectThenResumeConverges` | 拒绝后继续消费并多代重连补齐，最终视图与一直在线且跟得上的订阅一致（不重不漏） |
+| `TestConcurrentGapExpiryTinyQueues` | 多发布方×多订阅者、队列容量 2、保留窗口 32：空档边产生边过期，不卡死、位点不漂移、账目对得上 |
 | `TestAckIgnoresNonMatchingSeq` | 非匹配主题序列号不构成空档 |
 | `TestResumePositionValidation` | 续传位点过期 `ErrPositionExpired` 与超前 `ErrAckNotDelivered` |
 | `TestResumeAfterReconnect` / `TestConcurrentResume` | 断线续传不丢不重、多代重连位点一致 |

@@ -175,7 +175,12 @@ func (b *Broker) Publish(topic string, version Version, payload []byte) (uint64,
 	b.log = append(b.log, m)
 	if cut := len(b.log) - b.cfg.Retention; cut > 0 {
 		b.log = append([]Message(nil), b.log[cut:]...)
+		// 裁剪后窗口最早存活的 Seq：订阅侧据此区分丢失位点“还能补齐”与
+		// “已滚出窗口、重连也补不回来”。对所有登记订阅（含已退订）推送，
+		// 锁序仍为 broker.mu -> sub.mu。
+		newOldest := b.log[0].Seq
 		for s := range b.subs {
+			s.setRetentionWatermark(newOldest)
 			// 只调整仍在续传积压中的游标；已追上实时的订阅游标本就等于日志长度，
 			// 裁剪后应继续指向新的日志末尾，绝不能回移到保留区内部
 			// （否则会被误判为“仍有积压”，实时投递错误地转入续传而停滞）。
@@ -276,6 +281,11 @@ func (b *Broker) SubscribeWith(pattern string, resumeFrom uint64, opts Subscribe
 			sub.replayIdx = i
 			break
 		}
+	}
+	// 初始化保留窗口水位：本代订阅生命周期内丢失的位点若滚出该窗口，
+	// Ack 跨过时会得到 ErrAckGapExpired 而不是“还能补齐”的 ErrAckGap。
+	if len(b.log) > 0 {
+		sub.oldestRetained = b.log[0].Seq
 	}
 	b.subs[sub] = struct{}{}
 	sub.replayPending = true

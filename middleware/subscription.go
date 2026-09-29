@@ -23,7 +23,12 @@ type Subscription struct {
 	lastSeen  uint64   // 已真正交到本订阅手上的最大匹配序列号（入队或被挤掉），用于去重与确认水位
 	lastAcked uint64   // 已确认位点
 	lost      []uint64 // 已判定丢失、尚未靠续传补齐的匹配位点，严格升序
-	stats     Stats
+	// oldestRetained 是 Broker 最近一次推送的保留日志最早 Seq（0 表示日志为空）。
+	// lost 中 seq >= oldestRetained 的空档仍可重连补齐，< oldestRetained 则已
+	// 滚出保留窗口、不可补齐。由 Broker 持有 broker.mu 时调用 setRetentionWatermark
+	// 更新（锁序 broker.mu -> sub.mu），订阅侧只在 sub.mu 内读取。
+	oldestRetained uint64
+	stats          Stats
 
 	// 续传游标，仅由 Broker 持有 broker.mu 时访问：
 	// replayIdx 是下一条待考虑的保留日志下标；replayPending 表示尚有积压未续完。
@@ -57,6 +62,14 @@ func (s *Subscription) isClosed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closed
+}
+
+// setRetentionWatermark 由 Broker 持有 broker.mu 时调用，推送保留日志最早 Seq。
+// oldest==0 表示日志为空（尚无消息可补）。水位单调不降，调用方需保证这一点。
+func (s *Subscription) setRetentionWatermark(oldest uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.oldestRetained = oldest
 }
 
 // offer 由 Broker 调用，把一条匹配消息交给本订阅。replay=false 为实时投递，
@@ -176,7 +189,15 @@ func (s *Subscription) close() {
 // 且原因可通过 errors.Is 区分，位点保持不变：
 //   - ErrPositionRegression：seq 小于当前已确认位点（回退）；
 //   - ErrAckNotDelivered：seq 超过该订阅已交到手上的水位（确认到一个没交到手的位置）；
-//   - ErrAckGap：(当前位点, seq] 区间内存在已判定丢失、尚未补齐的位点（中间留了空档）。
+//   - ErrAckGap：(当前位点, seq] 区间内存在已判定丢失、尚未补齐、且仍在保留窗口内
+//     的位点（中间留了空档，但还来得及靠重连续传补齐，继续等待即可）；
+//   - ErrAckGapExpired：区间内的空档位点已滚出保留窗口，怎么重连都补不回来，
+//     应尽快重置订阅。它同时属于 ErrAckGap（errors.Is 两者皆命中）。
+//
+// 判定边界：保留窗口最早尚存活的位点为 oldestRetained 时，丢失位点
+// g >= oldestRetained 仍可补齐（卡在窗口边缘、只差一点点也算可补，绝不误判过期）；
+// g < oldestRetained 才是彻底不可补齐。只检查区间内最早的一个丢失位点即可：
+// 它若不可补，后面的更旧缺口同样不可补，错误信息明确指出该位点。
 func (s *Subscription) Ack(seq uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -184,14 +205,22 @@ func (s *Subscription) Ack(seq uint64) error {
 		return fmt.Errorf("%w: current position %d, attempted ack %d",
 			ErrPositionRegression, s.lastAcked, seq)
 	}
+	// 区间内最早一个还没补齐的丢失位点，决定拒绝原因。
+	i := sort.Search(len(s.lost), func(i int) bool { return s.lost[i] > s.lastAcked })
+	if i < len(s.lost) && s.lost[i] <= seq {
+		g := s.lost[i]
+		// 从未发布到保留日志为空（oldestRetained==0）之间不存在“滚出窗口”：
+		// 水位为 0 时一律按仍可补齐处理。
+		if s.oldestRetained != 0 && g < s.oldestRetained {
+			return fmt.Errorf("%w: attempted ack %d skips unrecoverable position %d (position %d, oldest retained %d)",
+				ErrAckGapExpired, seq, g, s.lastAcked, s.oldestRetained)
+		}
+		return fmt.Errorf("%w: attempted ack %d skips undelivered position %d (position %d)",
+			ErrAckGap, seq, g, s.lastAcked)
+	}
 	if seq > s.lastSeen {
 		return fmt.Errorf("%w: attempted ack %d beyond delivered watermark %d",
 			ErrAckNotDelivered, seq, s.lastSeen)
-	}
-	i := sort.Search(len(s.lost), func(i int) bool { return s.lost[i] > s.lastAcked })
-	if i < len(s.lost) && s.lost[i] <= seq {
-		return fmt.Errorf("%w: attempted ack %d skips undelivered position %d (position %d)",
-			ErrAckGap, seq, s.lost[i], s.lastAcked)
 	}
 	s.lastAcked = seq
 	s.pruneLostLocked()

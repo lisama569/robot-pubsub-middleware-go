@@ -1,6 +1,9 @@
 package middleware
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Version 是消息协议版本。Broker 只接受其支持版本集合内的消息。
 type Version uint16
@@ -21,9 +24,17 @@ var (
 	// ErrAckNotDelivered 表示确认的位点超过了该订阅实际已见到的最大位点，
 	// 即确认到一个从未交到该订阅手上的位置。
 	ErrAckNotDelivered = errors.New("middleware: ack position not delivered")
-	// ErrAckGap 表示确认区间内存在已判定丢失、尚未补齐的位点
-	// （典型：DropOldest 挤掉的消息还没靠重连续传补回），不允许跨过空档确认。
+	// ErrAckGap 表示确认区间内存在已判定丢失、尚未补齐、但仍在 Broker 保留
+	// 窗口之内的位点（典型：DropOldest 挤掉的消息还没靠重连续传补回）。
+	// 这类空档还来得及补齐：保持位点、尽快从当前确认位点重连即可补回，
+	// 不允许跨过空档确认。
 	ErrAckGap = errors.New("middleware: ack position has a gap")
+	// ErrAckGapExpired 表示确认区间内存在已滚出 Broker 保留窗口的丢失位点，
+	// 该空档怎么重连都无法从保留日志补齐，订阅方应尽快重置订阅，而不是继续等待。
+	// 该错误同时 wraps ErrAckGap：errors.Is(err, ErrAckGap) 对“任意空档”都成立，
+	// errors.Is(err, ErrAckGapExpired) 仅对彻底不可补齐的空档成立。
+	ErrAckGapExpired = fmt.Errorf("%w (unrecoverable): %w", ErrAckGap,
+		errors.New("middleware: ack gap older than retention window"))
 	// ErrPositionExpired 表示续传起始位点早于 Broker 保留窗口的最早消息，
 	// 中间缺口已无法从保留日志补齐。
 	ErrPositionExpired = errors.New("middleware: resume position older than retention window")
